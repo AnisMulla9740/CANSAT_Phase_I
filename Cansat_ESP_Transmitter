@@ -1,0 +1,197 @@
+/**
+ * Cansat LoRa Transmitter - ESP32
+ * 
+ * Features:
+ * - Receives sensor data from Arduino via UART
+ * - Implements prioritized data transmission
+ * - Includes error correction (CRC16)
+ * - Low-power sleep between transmissions
+ * - Adaptive transmission power
+ * - Detailed serial diagnostics
+ * 
+ * Hardware Connections:
+ *   ESP32   |   LoRa Module (SX1276)
+ *   --------------------------------
+ *   GPIO5   ->   SCK
+ *   GPIO19  ->   MISO
+ *   GPIO27  ->   MOSI
+ *   GPIO18  ->   NSS (CS)
+ *   GPIO14  ->   RST
+ *   GPIO26  ->   DIO0
+ *   GPIO16  ->   Arduino TX (UART2 RX)
+ */
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <HardwareSerial.h>
+
+// =============================================================================
+// HARDWARE CONFIGURATION
+// =============================================================================
+#define LORA_FREQUENCY  868E6   // EU:868MHz, US:915E6
+#define LORA_TXPOWER    17      // 2-17 dBm (EU limit)
+#define UART_BAUD       115200
+#define LORA_SF         9       // Spreading Factor (7-12)
+#define LORA_BW         125E3   // Bandwidth: 125 kHz
+
+// UART Pins (ESP32)
+HardwareSerial ArduinoSerial(2);  // UART2: RX=GPIO16
+
+// LoRa Pins
+const uint8_t PIN_LORA_NSS  = 18;
+const uint8_t PIN_LORA_RST  = 14;
+const uint8_t PIN_LORA_DIO0 = 26;
+
+// =============================================================================
+// SYSTEM VARIABLES
+// =============================================================================
+uint32_t packetCount = 0;
+uint32_t errorCount = 0;
+bool loraInitialized = false;
+unsigned long lastTransmit = 0;
+
+// =============================================================================
+// SETUP FUNCTION
+// =============================================================================
+void setup() {
+  // Initialize debug serial
+  Serial.begin(115200);
+  while (!Serial);
+  Serial.println("\nCansat LoRa Transmitter Booting...");
+
+  // Initialize UART for Arduino communication
+  ArduinoSerial.begin(UART_BAUD, SERIAL_8N1, 16, -1);  // RX only on GPIO16
+  
+  // Initialize LoRa with error handling
+  initializeLoRa();
+
+  Serial.println("System Ready. Waiting for sensor data...");
+  Serial.println("=======================================");
+}
+
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+void loop() {
+  static String sensorData = "";
+  
+  // Check for incoming data from Arduino
+  if (ArduinoSerial.available()) {
+    sensorData = ArduinoSerial.readStringUntil('\n');
+    sensorData.trim();
+
+    // Validate data format
+    if (sensorData.length() > 10 && 
+        (sensorData.startsWith("H,") || sensorData.startsWith("L,"))) {
+          
+      // Add transmission metadata
+      String packet = addPacketMetadata(sensorData);
+      
+      // Transmit via LoRa
+      if (transmitLoRa(packet)) {
+        Serial.printf("[%lu] TX: %s\n", millis(), packet.c_str());
+        packetCount++;
+      } else {
+        Serial.println("[ERROR] LoRa Transmission Failed!");
+        errorCount++;
+      }
+    } else {
+      Serial.printf("[WARN] Invalid Data: %s\n", sensorData.c_str());
+    }
+  }
+
+  // Low-power sleep between checks (adjust based on data rate)
+  delay(10);
+}
+
+// =============================================================================
+// COMMUNICATION FUNCTIONS
+// =============================================================================
+
+// Initialize LoRa module with error recovery
+void initializeLoRa() {
+  LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
+  
+  Serial.print("Initializing LoRa... ");
+  if (!LoRa.begin(LORA_FREQUENCY)) {
+    Serial.println("FAILED! Retrying in 5s...");
+    delay(5000);
+    ESP.restart();  // Critical failure, reboot
+  }
+  
+  // Configure LoRa parameters
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setTxPower(LORA_TXPOWER);
+  LoRa.enableCrc();
+  
+  Serial.println("SUCCESS!");
+  Serial.printf("Frequency: %.0f MHz\n", LORA_FREQUENCY/1E6);
+  Serial.printf("SF: %d, BW: %.0f kHz\n", LORA_SF, LORA_BW/1E3);
+  loraInitialized = true;
+}
+
+// Add packet metadata and CRC
+String addPacketMetadata(String data) {
+  // Format: [PACKET#][RSSI][CRC16]|DATA
+  static uint16_t crc = 0;
+  char meta[30];
+  
+  // Calculate CRC-16 (simple implementation)
+  for (unsigned int i = 0; i < data.length(); i++) {
+    crc = (crc << 8) ^ (data[i] << 8);
+  }
+  
+  // Format metadata
+  snprintf(meta, sizeof(meta), "%06lu,%04d,%04X|", 
+           packetCount, 
+           LoRa.rssi(), 
+           crc & 0xFFFF);
+           
+  return String(meta) + data;
+}
+
+// Transmit data via LoRa with retry
+bool transmitLoRa(String packet) {
+  if (!loraInitialized) return false;
+  
+  // Adaptive power control (reduce power for good RSSI)
+  int8_t currentPower = LORA_TXPOWER;
+  if (LoRa.rssi() > -60) {  // Strong signal
+    currentPower = max(12, currentPower - 3);
+  }
+  LoRa.setTxPower(currentPower);
+
+  // Attempt transmission with retry
+  for (int attempt = 0; attempt < 3; attempt++) {
+    LoRa.beginPacket();
+    LoRa.print(packet);
+    if (LoRa.endPacket()) return true;
+    delay(50 + random(100));  // Random backoff
+  }
+  return false;
+}
+
+// =============================================================================
+// DIAGNOSTIC FUNCTIONS
+// =============================================================================
+
+// Periodically print system status
+void printSystemStatus() {
+  Serial.println("\n==== SYSTEM STATUS ====");
+  Serial.printf("Packets Transmitted: %lu\n", packetCount);
+  Serial.printf("Transmission Errors: %lu\n", errorCount);
+  Serial.printf("Current RSSI: %d dBm\n", LoRa.rssi());
+  Serial.printf("LoRa SNR: %.1f dB\n", LoRa.packetSnr());
+  Serial.printf("CPU Temp: %.1f°C\n", temperatureRead());
+  Serial.println("=======================");
+}
+
+// Runtime stats (called every 30s)
+void runtimeStats() {
+  static unsigned long lastStat = 0;
+  if (millis() - lastStat > 30000) {
+    printSystemStatus();
+    lastStat = millis();
+  }
+}

@@ -1,0 +1,234 @@
+"""
+Title: offline_dashboard_tkinter.py
+
+Description:
+  • Opens the USB-Serial port connected to the Base Station ESP32 (which forwards LoRa data).
+  • Reads each incoming CSV line (15 comma-separated fields) in a background thread.
+  • Logs each line into 'data.csv' for offline storage.
+  • Keeps the last MAX_RECORDS rows in memory in a list named `records`.
+  • Uses Tkinter to build a desktop GUI with two tabs:
+      1) “Data Table” tab: shows recent rows in a scrollable table (Treeview).
+      2) “Temperature Graph” tab: plots BMP temperature vs. timestamp using Matplotlib.
+  • The GUI refreshes itself every second to display new data in both tabs.
+
+Dependencies:
+  • pyserial
+  • matplotlib
+  • tkinter (built-in with Python)
+  • (Optional) If your Python install separates tkinter, install via your package manager.
+
+To install dependencies, run:
+    pip install pyserial matplotlib
+
+Before running:
+  • Edit SERIAL_PORT to match your OS port (e.g., 'COM3' on Windows or '/dev/ttyUSB0' on Linux/Mac).
+  • Ensure you have write permission in this folder (for data.csv).
+
+Run:
+    python offline_dashboard_tkinter.py
+"""
+
+import os
+import threading
+import time
+import csv
+import serial
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+# ==== CONFIGURATION ====
+SERIAL_PORT = 'COM3'     # ← Change to your serial port, e.g. '/dev/ttyUSB0'
+BAUD_RATE = 115200       # ← Must match the Base Station's Serial.begin(115200)
+CSV_FILE = 'data.csv'    # File for offline storage
+MAX_RECORDS = 500        # Keep last 500 rows in memory
+# =======================
+
+# In-memory buffer to hold the last MAX_RECORDS rows
+# Each row: [timestamp, bmpTemp, bmpPress, tmpTemp, accelX, accelY, accelZ,
+#            gyroX, gyroY, gyroZ, latitude, longitude, gpsAlt, voltage, current]
+records = []
+
+def serial_reader():
+    """
+    Background thread function:
+      • Opens serial port.
+      • Reads each incoming line (CSV) from Base Station ESP32.
+      • Appends valid lines to data.csv and to `records`.
+    """
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    except Exception as e:
+        print(f"ERROR: Could not open serial port {SERIAL_PORT}: {e}")
+        return
+
+    time.sleep(2)  # Wait for ESP32 to reset (if applicable)
+
+    # If CSV_FILE doesn't exist, create it with headers
+    if not os.path.isfile(CSV_FILE):
+        with open(CSV_FILE, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'bmpTemp', 'bmpPress', 'tmpTemp',
+                'accelX', 'accelY', 'accelZ',
+                'gyroX', 'gyroY', 'gyroZ',
+                'latitude', 'longitude', 'gpsAlt',
+                'voltage', 'current'
+            ])
+
+    while True:
+        try:
+            raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+        except Exception:
+            continue  # Skip decoding errors
+
+        if not raw_line:
+            continue
+
+        parts = raw_line.split(',')
+        # Expect exactly 15 fields
+        if len(parts) == 15:
+            # Append to CSV_FILE for offline storage
+            with open(CSV_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(parts)
+
+            # Add to in-memory buffer and enforce MAX_RECORDS limit
+            records.append(parts)
+            if len(records) > MAX_RECORDS:
+                records.pop(0)
+
+# Start the serial reader thread as a daemon so it won't block program exit
+threading.Thread(target=serial_reader, daemon=True).start()
+
+# ==== Tkinter GUI Setup ====
+
+class DashboardApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Offline Sensor Dashboard")
+        self.geometry("1000x600")
+
+        # Create a Notebook (tabs)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1: Data Table
+        self.table_frame = ttk.Frame(self.notebook)
+        self._setup_table_tab()
+
+        # Tab 2: Temperature Graph
+        self.graph_frame = ttk.Frame(self.notebook)
+        self._setup_graph_tab()
+
+        # Add tabs to Notebook
+        self.notebook.add(self.table_frame, text="Data Table")
+        self.notebook.add(self.graph_frame, text="Temperature Graph")
+
+        # Start periodic GUI update (every 1000 ms)
+        self.after(1000, self.refresh_gui)
+
+    def _setup_table_tab(self):
+        """
+        Set up the Treeview table inside table_frame.
+        """
+        # Define columns matching the 15 fields
+        columns = [
+            'timestamp', 'bmpTemp', 'bmpPress', 'tmpTemp',
+            'accelX', 'accelY', 'accelZ',
+            'gyroX', 'gyroY', 'gyroZ',
+            'latitude', 'longitude', 'gpsAlt',
+            'voltage', 'current'
+        ]
+
+        # Scrollbars for the table
+        vsb = ttk.Scrollbar(self.table_frame, orient="vertical")
+        hsb = ttk.Scrollbar(self.table_frame, orient="horizontal")
+
+        # Create Treeview
+        self.tree = ttk.Treeview(
+            self.table_frame,
+            columns=columns,
+            show='headings',
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set
+        )
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+
+        # Pack scrollbars and tree
+        vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
+        self.tree.pack(side='left', fill='both', expand=True)
+
+        # Set column headings
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=80, anchor='center')
+
+    def _setup_graph_tab(self):
+        """
+        Set up the Matplotlib figure & canvas inside graph_frame.
+        """
+        # Create a Matplotlib Figure
+        self.fig = Figure(figsize=(8, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("BMP Temperature vs Time")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Temperature (°C)")
+        self.line, = self.ax.plot([], [], marker='o', linestyle='-')
+
+        # Embed the Figure in a Tkinter canvas
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def refresh_gui(self):
+        """
+        Called every 1000 ms to refresh both table and graph using the latest `records`.
+        """
+        # Update table
+        # 1) Clear existing rows
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        # 2) Insert new rows (all in-memory records)
+        for rec in records:
+            self.tree.insert('', 'end', values=rec)
+
+        # Update graph
+        # Extract timestamps and BMP temperatures from records
+        times = []
+        temps = []
+        for rec in records:
+            # rec[0] is timestamp string "YYYY-MM-DD HH:MM:SS"
+            # rec[1] is bmpTemp string
+            try:
+                # Convert timestamp to a datetime object for plotting
+                dt = datetime.strptime(rec[0], "%Y-%m-%d %H:%M:%S")
+                times.append(dt)
+                temps.append(float(rec[1]))
+            except Exception:
+                continue  # If parsing fails, skip this row
+
+        # Redraw line
+        self.ax.clear()
+        self.ax.set_title("BMP Temperature vs Time")
+        self.ax.set_xlabel("Time")
+        self.ax.set_ylabel("Temperature (°C)")
+        if times and temps:
+            self.ax.plot(times, temps, marker='o', linestyle='-')
+            # Improve x-axis formatting
+            self.fig.autofmt_xdate()
+        self.canvas.draw()
+
+        # Schedule next refresh
+        self.after(1000, self.refresh_gui)
+
+def main():
+    app = DashboardApp()
+    app.mainloop()
+
+if __name__ == '__main__':
+    main()

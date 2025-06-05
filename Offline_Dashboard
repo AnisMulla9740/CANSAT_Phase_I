@@ -28,6 +28,7 @@ Run:
     python offline_dashboard_tkinter.py
 """
 
+'------------------------------------------------------------------------------------------------'
 import os
 import threading
 import time
@@ -38,25 +39,23 @@ from tkinter import ttk
 from datetime import datetime
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+import matplotlib.dates as mdates
 
-# ==== CONFIGURATION ====
-SERIAL_PORT = 'COM3'     # ← Change to your serial port, e.g. '/dev/ttyUSB0'
-BAUD_RATE = 115200       # ← Must match the Base Station's Serial.begin(115200)
-CSV_FILE = 'data.csv'    # File for offline storage
-MAX_RECORDS = 500        # Keep last 500 rows in memory
-# =======================
+# ==== UPDATED CONFIGURATION ====
+SERIAL_PORT = 'COM3'     # Change to your serial port
+BAUD_RATE = 115200
+CSV_FILE = 'data.csv'
+MAX_RECORDS = 500
+# ===============================
 
-# In-memory buffer to hold the last MAX_RECORDS rows
-# Each row: [timestamp, bmpTemp, bmpPress, tmpTemp, accelX, accelY, accelZ,
-#            gyroX, gyroY, gyroZ, latitude, longitude, gpsAlt, voltage, current]
 records = []
 
 def serial_reader():
     """
-    Background thread function:
-      • Opens serial port.
-      • Reads each incoming line (CSV) from Base Station ESP32.
-      • Appends valid lines to data.csv and to `records`.
+    Revised serial reader that:
+    - Parses LoRa packet header
+    - Handles both H and L data types
+    - Maintains correct field structure
     """
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
@@ -64,17 +63,16 @@ def serial_reader():
         print(f"ERROR: Could not open serial port {SERIAL_PORT}: {e}")
         return
 
-    time.sleep(2)  # Wait for ESP32 to reset (if applicable)
+    time.sleep(2)
 
-    # If CSV_FILE doesn't exist, create it with headers
+    # Create CSV with proper headers
     if not os.path.isfile(CSV_FILE):
         with open(CSV_FILE, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'timestamp', 'bmpTemp', 'bmpPress', 'tmpTemp',
-                'accelX', 'accelY', 'accelZ',
-                'gyroX', 'gyroY', 'gyroZ',
-                'latitude', 'longitude', 'gpsAlt',
+                'type', 'timestamp', 'imu_x', 'imu_y', 'imu_z', 
+                'pressure', 'altitude', 'temperature', 
+                'latitude', 'longitude', 'sats',
                 'voltage', 'current'
             ])
 
@@ -82,149 +80,209 @@ def serial_reader():
         try:
             raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
         except Exception:
-            continue  # Skip decoding errors
+            continue
 
         if not raw_line:
             continue
 
-        parts = raw_line.split(',')
-        # Expect exactly 15 fields
-        if len(parts) == 15:
-            # Append to CSV_FILE for offline storage
+        # Parse LoRa packet: [PACKET#][RSSI][CRC16]|DATA
+        if '|' not in raw_line:
+            continue
+            
+        header_part, data_part = raw_line.split('|', 1)
+        data_fields = data_part.split(',')
+        
+        # Process High-priority packets
+        if data_fields[0] == 'H' and len(data_fields) == 11:
+            # H,timestamp,imu_x,imu_y,imu_z,pressure,altitude,temp,lat,lon,sats
+            record = [
+                'H',  # type
+                data_fields[1],  # timestamp
+                *data_fields[2:5],  # imu x,y,z
+                *data_fields[5:8],  # pressure, altitude, temp
+                *data_fields[8:11]  # lat, lon, sats
+            ]
+            # Pad missing fields
+            record.extend(['', ''])  # voltage, current
+            
             with open(CSV_FILE, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(parts)
+                writer.writerow(record[:-2])  # Save without empty voltage/current
+                
+            records.append(record)
+            
+        # Process Low-priority packets
+        elif data_fields[0] == 'L' and len(data_fields) == 4:
+            # L,timestamp,voltage,current
+            record = [
+                'L',  # type
+                data_fields[1],  # timestamp
+                *['']*3,  # imu x,y,z (empty)
+                *['']*3,  # pressure, altitude, temp (empty)
+                *['']*3,  # lat, lon, sats (empty)
+                *data_fields[2:4]  # voltage, current
+            ]
+            
+            with open(CSV_FILE, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'L', data_fields[1], 
+                    *data_fields[2:4]  # voltage, current
+                ])
+                
+            records.append(record)
+            
+        # Maintain buffer size
+        if len(records) > MAX_RECORDS:
+            records.pop(0)
 
-            # Add to in-memory buffer and enforce MAX_RECORDS limit
-            records.append(parts)
-            if len(records) > MAX_RECORDS:
-                records.pop(0)
-
-# Start the serial reader thread as a daemon so it won't block program exit
+# Start serial reader thread
 threading.Thread(target=serial_reader, daemon=True).start()
 
-# ==== Tkinter GUI Setup ====
+# ==== REVISED TKINTER GUI ====
 
 class DashboardApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Offline Sensor Dashboard")
-        self.geometry("1000x600")
+        self.title("Cansat Ground Station Dashboard")
+        self.geometry("1200x700")
+        self.configure(bg='#2c3e50')
 
-        # Create a Notebook (tabs)
+        # Custom style
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self.style.configure('TNotebook', background='#34495e')
+        self.style.configure('TNotebook.Tab', background='#34495e', foreground='white')
+        self.style.map('TNotebook.Tab', background=[('selected', '#1abc9c')])
+
+        # Create tabs
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        # Tab 1: Data Table
+        # Create frames
         self.table_frame = ttk.Frame(self.notebook)
-        self._setup_table_tab()
-
-        # Tab 2: Temperature Graph
         self.graph_frame = ttk.Frame(self.notebook)
+        
+        self.notebook.add(self.table_frame, text="Sensor Data")
+        self.notebook.add(self.graph_frame, text="Temperature Analysis")
+        
+        # Setup tabs
+        self._setup_table_tab()
         self._setup_graph_tab()
-
-        # Add tabs to Notebook
-        self.notebook.add(self.table_frame, text="Data Table")
-        self.notebook.add(self.graph_frame, text="Temperature Graph")
-
-        # Start periodic GUI update (every 1000 ms)
+        
+        # Status bar
+        self.status = tk.Label(self, text="Receiving data...", bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        # Start refresh cycle
+        self.last_update = time.time()
         self.after(1000, self.refresh_gui)
 
     def _setup_table_tab(self):
-        """
-        Set up the Treeview table inside table_frame.
-        """
-        # Define columns matching the 15 fields
+        """Setup the data table with proper columns"""
         columns = [
-            'timestamp', 'bmpTemp', 'bmpPress', 'tmpTemp',
-            'accelX', 'accelY', 'accelZ',
-            'gyroX', 'gyroY', 'gyroZ',
-            'latitude', 'longitude', 'gpsAlt',
-            'voltage', 'current'
+            'Type', 'Timestamp', 'IMU X', 'IMU Y', 'IMU Z',
+            'Pressure (hPa)', 'Altitude (m)', 'Temp (°C)',
+            'Latitude', 'Longitude', 'Sats',
+            'Voltage (V)', 'Current (A)'
         ]
-
-        # Scrollbars for the table
-        vsb = ttk.Scrollbar(self.table_frame, orient="vertical")
-        hsb = ttk.Scrollbar(self.table_frame, orient="horizontal")
-
-        # Create Treeview
+        
+        # Create treeview with scrollbars
+        tree_scroll = tk.Scrollbar(self.table_frame)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
         self.tree = ttk.Treeview(
             self.table_frame,
             columns=columns,
             show='headings',
-            yscrollcommand=vsb.set,
-            xscrollcommand=hsb.set
+            yscrollcommand=tree_scroll.set,
+            selectmode='extended',
+            height=25
         )
-        vsb.config(command=self.tree.yview)
-        hsb.config(command=self.tree.xview)
-
-        # Pack scrollbars and tree
-        vsb.pack(side='right', fill='y')
-        hsb.pack(side='bottom', fill='x')
-        self.tree.pack(side='left', fill='both', expand=True)
-
-        # Set column headings
+        tree_scroll.config(command=self.tree.yview)
+        
+        # Configure columns
         for col in columns:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=80, anchor='center')
+            self.tree.column(col, width=100, anchor='center')
+        
+        self.tree.pack(fill=tk.BOTH, expand=True)
 
     def _setup_graph_tab(self):
-        """
-        Set up the Matplotlib figure & canvas inside graph_frame.
-        """
-        # Create a Matplotlib Figure
-        self.fig = Figure(figsize=(8, 4), dpi=100)
+        """Setup temperature graph with proper formatting"""
+        self.fig = Figure(figsize=(10, 5), dpi=100, facecolor='#ecf0f1')
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("BMP Temperature vs Time")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel("Temperature (°C)")
-        self.line, = self.ax.plot([], [], marker='o', linestyle='-')
-
-        # Embed the Figure in a Tkinter canvas
+        self.ax.set_facecolor('#ecf0f1')
+        
+        # Formatting
+        self.ax.set_title("Temperature Trend", fontsize=14, color='#2c3e50')
+        self.ax.set_xlabel("Time", fontsize=12, color='#2c3e50')
+        self.ax.set_ylabel("Temperature (°C)", fontsize=12, color='#2c3e50')
+        self.ax.grid(True, linestyle='--', alpha=0.7)
+        
+        # Create canvas
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
-        self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def refresh_gui(self):
-        """
-        Called every 1000 ms to refresh both table and graph using the latest `records`.
-        """
+        """Update GUI with new data"""
+        # Update status
+        elapsed = time.time() - self.last_update
+        self.status.config(text=f"Records: {len(records)} | Last update: {elapsed:.1f}s ago")
+        self.last_update = time.time()
+        
         # Update table
-        # 1) Clear existing rows
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-        # 2) Insert new rows (all in-memory records)
-        for rec in records:
+        self.tree.delete(*self.tree.get_children())
+        for rec in records[-100:]:  # Show last 100 records
             self.tree.insert('', 'end', values=rec)
-
+        
         # Update graph
-        # Extract timestamps and BMP temperatures from records
-        times = []
-        temps = []
-        for rec in records:
-            # rec[0] is timestamp string "YYYY-MM-DD HH:MM:SS"
-            # rec[1] is bmpTemp string
-            try:
-                # Convert timestamp to a datetime object for plotting
-                dt = datetime.strptime(rec[0], "%Y-%m-%d %H:%M:%S")
-                times.append(dt)
-                temps.append(float(rec[1]))
-            except Exception:
-                continue  # If parsing fails, skip this row
-
-        # Redraw line
-        self.ax.clear()
-        self.ax.set_title("BMP Temperature vs Time")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel("Temperature (°C)")
-        if times and temps:
-            self.ax.plot(times, temps, marker='o', linestyle='-')
-            # Improve x-axis formatting
-            self.fig.autofmt_xdate()
-        self.canvas.draw()
-
-        # Schedule next refresh
+        self.update_temperature_graph()
+        
+        # Schedule next update
         self.after(1000, self.refresh_gui)
+
+    def update_temperature_graph(self):
+        """Plot temperature data with correct timestamp handling"""
+        times, temps = [], []
+        
+        for rec in records:
+            if rec[0] == 'H':  # Only high-priority packets
+                try:
+                    # Parse Arduino timestamp: YYYYMMDD-HHMMSS
+                    dt = datetime.strptime(rec[1], "%Y%m%d-%H%M%S")
+                    temp = float(rec[7])  # Temperature at index 7
+                    times.append(dt)
+                    temps.append(temp)
+                except (ValueError, IndexError):
+                    continue
+        
+        # Update plot
+        self.ax.clear()
+        if times and temps:
+            self.ax.plot(times, temps, 'o-', color='#3498db', linewidth=2, markersize=6)
+            
+            # Format x-axis with time
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+            self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+            self.fig.autofmt_xdate()
+            
+            # Set titles and labels
+            self.ax.set_title("Temperature Trend", fontsize=14, color='#2c3e50')
+            self.ax.set_xlabel("Time", fontsize=12, color='#2c3e50')
+            self.ax.set_ylabel("Temperature (°C)", fontsize=12, color='#2c3e50')
+            self.ax.grid(True, linestyle='--', alpha=0.7)
+            
+            # Add annotation for latest reading
+            last_temp = temps[-1]
+            last_time = times[-1]
+            self.ax.annotate(f'{last_temp:.1f}°C', 
+                            xy=(last_time, last_temp),
+                            xytext=(10, -20),
+                            textcoords='offset points',
+                            arrowprops=dict(arrowstyle='->'))
+        
+        self.canvas.draw()
 
 def main():
     app = DashboardApp()
